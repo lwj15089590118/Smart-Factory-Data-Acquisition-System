@@ -1,0 +1,13 @@
+# Smart-Factory-Data-Acquisition-System - Python 上位机依赖
+# Python >= 3.9
+# 安装: pip install -r requirements.txt
+
+Flask==3.0.3                # Web 框架, 提供看板页面与 REST API
+Werkzeug==3.0.3             # Flask 内置 WSGI 工具库
+paho-mqtt==1.6.1            # MQTT 客户端, 订阅节点数据/下发命令
+pandas==2.2.2               # 数据统计分析(最大/最小/均值/波动率)
+numpy==1.26.4               # pandas 依赖, 数值计算
+flask-cors==4.0.1           # 跨域支持(可选, 大屏二次开发用)
+requests==2.32.3            # HTTP 调试工具(可选)
+openpyxl==3.1.5             # Excel 报表导出(可选)
+APScheduler==3.10.4         # 定时任务: 日报/周报自动生成(可选)
