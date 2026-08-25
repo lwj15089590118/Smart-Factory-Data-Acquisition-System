@@ -90,6 +90,7 @@ static uint32_t      g_uptime       = 0;        /* 上电秒数           */
 static float         g_iZeroVolt    = 2.5f;     /* 电流通道零点(V), 上电自校准 */
 static uint16_t      g_adcWin[8]    = {0};      /* 滑动平均窗口       */
 static uint8_t       g_winIdx       = 0;
+static volatile uint32_t g_msTicks  = 0;        /* 毫秒时基(SysTick中断维护) */
 
 #define VREF            3.300f                  /* ADC 基准电压        */
 #define ACS_SENS        0.100f                  /* ACS712-20A 灵敏度 100mV/A */
@@ -101,24 +102,39 @@ static uint8_t       g_winIdx       = 0;
 extern const unsigned char ASCII6x8[][6];
 
 /* ============================================================
- *                        SysTick 延时
+ *                        SysTick 延时与时基
+ * 1ms 中断维护 g_msTicks; DelayUs 用计数器现值忙等(<1ms 短延时)
  * ============================================================ */
+void SysTick_Handler(void)
+{
+    g_msTicks++;                                /* 上电毫秒计数 */
+}
+
 static void Delay_Init(void)
 {
     SysTick->CTRL = 0;
-    SysTick->LOAD = 72 - 1;                     /* 1us @72MHz */
+    SysTick->LOAD = 72000 - 1;                  /* 1ms @72MHz */
     SysTick->VAL  = 0;
-    SysTick->CTRL = 5;                          /* 处理器时钟, 使能, 不开中断 */
+    SysTick->CTRL = 7;                          /* 处理器时钟+使能+开中断 */
 }
 
 static void DelayUs(uint32_t us)
 {
-    while (us--) {
-        while (!(SysTick->CTRL & (1 << 16)));   /* 等待 COUNTFLAG */
-    }
+    uint32_t start = SysTick->VAL;
+    uint32_t ticks = us * 72;                   /* 72 cycles/us */
+    uint32_t delta, now;
+    do {
+        now   = SysTick->VAL;
+        delta = (start >= now) ? (start - now)
+                               : (start + (SysTick->LOAD + 1) - now);
+    } while (delta < ticks);                    /* 仅适用于 us<1000 的短延时 */
 }
 
-static void DelayMs(uint32_t ms) { while (ms--) DelayUs(1000); }
+static void DelayMs(uint32_t ms)
+{
+    uint32_t start = g_msTicks;
+    while ((g_msTicks - start) < ms);
+}
 
 /* ============================================================
  *                     OLED 软件位带 I2C
@@ -450,10 +466,10 @@ static void KEY_BEEP_Init(void)
 static uint8_t KEY_Scan(void)
 {
     static uint8_t  lastKey = 0xFF, stable = 0xFF, holdCnt = 0;
-    static uint32_t lastTick = 0;
+    static uint32_t lastScan = 0;
     uint8_t k, cur = 0xFF, i;
-    if (g_uptime == lastTick) return 0xFF;      /* 20ms 节流 */
-    lastTick = g_uptime;
+    if ((g_msTicks - lastScan) < 20) return 0xFF;   /* 20ms 节流 */
+    lastScan = g_msTicks;
     for (i = 0; i < 3; i++)
         if (GPIO_ReadInputDataBit(KEY_PORT(i), KEY_PIN(i)) == RESET) { cur = i; break; }
     if (cur != lastKey) { lastKey = cur; holdCnt = 0; return 0xFF; } /* 抖动期 */
@@ -608,13 +624,13 @@ static void UploadData(void)
  * ============================================================ */
 int main(void)
 {
-    uint32_t lastSec = 0, lastUpload = 0, lastOled = 0;
+    uint32_t lastSec = 0, lastUpload = 0, lastOled = 0, lastRetry = 0;
     uint16_t adcI, adcU;
     uint8_t  dhtErrCnt = 0;
     float    t, h;
 
     SystemInit();
-    Delay_Init();
+    Delay_Init();                               /* 先建 1ms SysTick 时基 */
     USART1_Init();
     USART2_Init();
     KEY_BEEP_Init();
@@ -631,11 +647,13 @@ int main(void)
     OLED_Clear();
 
     while (1) {
-        g_uptime = lastSec;                     /* 主循环秒计数 */
-        DelayMs(50);
-        if (g_uptime != lastOled) { lastOled = g_uptime; OLED_ShowMain(); }       /* 1s 刷屏 */
-        if (g_uptime - lastSec >= 2) {                                              /* 2s 采样 */
-            lastSec = g_uptime;
+        uint32_t nowSec = g_msTicks / 1000u;    /* 上电秒数 */
+        g_uptime = nowSec;
+
+        if (nowSec != lastOled) { lastOled = nowSec; OLED_ShowMain(); }   /* 1s 刷屏 */
+
+        if (nowSec - lastSec >= 2) {            /* 2s 采样 */
+            lastSec = nowSec;
             adcI = ADC_ReadFiltered(ADC_Channel_1);
             adcU = ADC_ReadFiltered(ADC_Channel_4);
             g_sensor.current = (adcI * VREF / 4095.0f - g_iZeroVolt) / ACS_SENS;
@@ -644,8 +662,16 @@ int main(void)
             else if (++dhtErrCnt > 5) { g_sensor.temp = -99.9f; g_sensor.humi = -1; }  /* 传感器故障 */
             Alarm_Check();
         }
-        if (g_mqttOk && g_uptime - lastUpload >= 5) { lastUpload = g_uptime; UploadData(); }  /* 5s 上传 */
-        if (!g_mqttOk && g_uptime % 30 == 0) ESP_MQTT_Init();                     /* 30s 重连 */
+
+        if (g_mqttOk && (nowSec - lastUpload >= 5)) {                     /* 5s 上传 */
+            lastUpload = nowSec;
+            UploadData();
+        }
+        if (!g_mqttOk && (nowSec - lastRetry >= 30)) {                    /* 30s 重连 */
+            lastRetry = nowSec;
+            ESP_MQTT_Init();
+        }
+
         Key_Handle(KEY_Scan());
     }
 }
