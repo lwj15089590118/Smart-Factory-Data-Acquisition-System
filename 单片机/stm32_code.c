@@ -549,16 +549,22 @@ static void Alarm_Check(void)
     if (g_alarmCnt[1] >= 3) g_sensor.alarm |= 2;
     if (g_alarmCnt[2] >= 3) g_sensor.alarm |= 4;
 
+    /* 继电器联锁仅电流持续越限(bit1)时吸合(调试记录 Day11 整改),
+       温度/电压报警只声光提示不切负载 */
+    if (g_sensor.alarm & 2) RELAY_ON();
+    else                    RELAY_OFF();
+
     if (g_sensor.alarm && !prev) {              /* 报警触发沿 */
         char payload[128];
-        BUZZER_ON(); RELAY_ON();                /* 声光报警+联锁 */
+        BUZZER_ON();                            /* 蜂鸣器对任意报警持续鸣响 */
         snprintf(payload, sizeof(payload),
                  "{\"deviceId\":\"" DEVICE_ID "\",\"alarm\":%d,\"temp\":%.1f,\"current\":%.2f,\"voltage\":%.1f,\"uptime\":%lu}",
-                 g_sensor.alarm, g_sensor.temp, g_sensor.current, g_sensor.voltage, g_uptime);
+                 g_sensor.alarm, g_sensor.temp, g_sensor.current, g_sensor.voltage,
+                 (unsigned long)g_uptime);
         MQTT_Publish("factory/" DEVICE_ID "/alarm", payload);
         printf("[ALM] ALARM! code=%d\r\n", g_sensor.alarm);
     } else if (!g_sensor.alarm && prev) {       /* 报警恢复沿 */
-        BUZZER_OFF(); RELAY_OFF();
+        BUZZER_OFF();
         printf("[ALM] alarm cleared\r\n");
     }
 }
