@@ -46,6 +46,7 @@ class Config:
     HISTORY_LEN   = 7200          # 环形缓冲容量（约 2 小时, 5s/条）
     DATA_DIR      = os.path.join(os.path.dirname(__file__), "data")
     CSV_PATH      = os.path.join(DATA_DIR, "history.csv")
+    TS_REORDER_TOLERANCE_S = 5.0  # uptime 回退容忍窗口: 其内视为 QoS1 重复/乱序丢弃
 
 
 # ============================================================
@@ -63,7 +64,7 @@ class DataStore:
         os.makedirs(Config.DATA_DIR, exist_ok=True)
 
     def add(self, payload: dict) -> bool:
-        """写入一条采集数据；时间戳回退或数值非法则丢弃（防数据跳变）"""
+        """写入一条采集数据；数值非法/QoS1重复/时间戳回退的报文丢弃（防数据跳变）"""
         try:
             ts = float(payload.get("uptime", int(time.time())))
             point = {
@@ -82,6 +83,10 @@ class DataStore:
         if point["temp"] < -50 or point["temp"] > 120:   # 物理范围校验
             return False
         with self.lock:
+            if self.last_ts and ts <= self.last_ts:
+                if self.last_ts - ts <= Config.TS_REORDER_TOLERANCE_S:
+                    return False                         # QoS1 重复/乱序报文直接丢弃
+                # 大幅回退视为节点重启, 接受并继续记录(协议 §5.1)
             self.buf["ts"].append(ts)
             for k, v in point.items():
                 self.buf[k].append(v)
