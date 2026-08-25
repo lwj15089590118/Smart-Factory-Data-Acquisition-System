@@ -76,6 +76,7 @@
 ```
 
 > `alarm=2`（bit1 置位）表示**电流越限**；`source=dashboard` 表示由看板二次判定触发。
+> 节点侧告警报文（`source=device`）因无 RTC **不含 time 字段**，事件时间以看板接收时刻为准。
 
 ### 3.3 在线状态 `factory/node1/status`（retain=1）
 

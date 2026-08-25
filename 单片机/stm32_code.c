@@ -718,10 +718,11 @@ static void Alarm_Check(void)
     else                    RELAY_OFF();
 
     if (g_sensor.alarm && !prev) {              /* 报警触发沿 */
-        char payload[128];
+        char payload[160];
         BUZZER_ON();                            /* 蜂鸣器对任意报警持续鸣响 */
         snprintf(payload, sizeof(payload),
-                 "{\"deviceId\":\"" DEVICE_ID "\",\"alarm\":%d,\"temp\":%.1f,\"current\":%.2f,\"voltage\":%.1f,\"uptime\":%lu}",
+                 "{\"deviceId\":\"" DEVICE_ID "\",\"source\":\"device\",\"alarm\":%d,"
+                 "\"temp\":%.1f,\"current\":%.2f,\"voltage\":%.1f,\"uptime\":%lu}",
                  g_sensor.alarm, g_sensor.temp, g_sensor.current, g_sensor.voltage,
                  (unsigned long)g_uptime);
         MQTT_Publish("factory/" DEVICE_ID "/alarm", payload);
