@@ -315,9 +315,22 @@ static uint8_t ESP_SendAT(const char *cmd, uint32_t waitMs)
     return 1;
 }
 
+/* 发布节点在线状态到 factory/<id>/status, retain=1(协议 §3.3) */
+static void MQTT_PublishStatus(const char *state)
+{
+    char cmd[192];
+    if (!g_mqttOk) return;
+    /* AT 命令字符串内的双引号须转义为 \" */
+    snprintf(cmd, sizeof(cmd),
+             "AT+MQTTPUB=0,\"factory/" DEVICE_ID "/status\","
+             "\"{\\\"deviceId\\\":\\\"" DEVICE_ID "\\\",\\\"state\\\":\\\"%s\\\","
+             "\\\"fw\\\":\\\"" FW_VERSION "\\\"}\",1,1", state);
+    ESP_SendAT(cmd, 300);
+}
+
 static void ESP_MQTT_Init(void)
 {
-    char cmd[160];
+    char cmd[192];
     uint8_t retry;
     for (retry = 0; retry < 3; retry++) {
         ESP_SendAT("AT+RST", 3000);
@@ -325,9 +338,15 @@ static void ESP_MQTT_Init(void)
         snprintf(cmd, sizeof(cmd), "AT+CWJAP=\"%s\",\"%s\"", WIFI_SSID, WIFI_PASS);
         if (ESP_SendAT(cmd, 8000)) {
             ESP_SendAT("AT+MQTTUSERCFG=0,1,\"" DEVICE_ID "\",\"" MQTT_USER "\",\"" MQTT_PASS "\",0,0,\"\"", 1000);
-            snprintf(cmd, sizeof(cmd), "AT+MQTTCONN=0,\"%s\",%d,1", BROKER_IP, BROKER_PORT);
+            /* keepalive=30s + 遗嘱 LWT: 异常掉线由 Broker 代发 retained offline(协议 §1/§3.3) */
+            snprintf(cmd, sizeof(cmd),
+                     "AT+MQTTCONNCFG=0,30,1,\"factory/" DEVICE_ID "/status\","
+                     "\"{\\\"deviceId\\\":\\\"" DEVICE_ID "\\\",\\\"state\\\":\\\"offline\\\"}\",1,1");
+            ESP_SendAT(cmd, 1000);
+            snprintf(cmd, sizeof(cmd), "AT+MQTTCONN=0,\"%s\",%d,30", BROKER_IP, BROKER_PORT);
             ESP_SendAT(cmd, 4000);
             g_mqttOk = 1;
+            MQTT_PublishStatus("online");
             printf("[NET] MQTT connected, retry=%d\r\n", retry);
             return;
         }
