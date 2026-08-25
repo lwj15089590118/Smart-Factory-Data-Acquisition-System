@@ -47,6 +47,7 @@ class Config:
     DATA_DIR      = os.path.join(os.path.dirname(__file__), "data")
     CSV_PATH      = os.path.join(DATA_DIR, "history.csv")
     TS_REORDER_TOLERANCE_S = 5.0  # uptime 回退容忍窗口: 其内视为 QoS1 重复/乱序丢弃
+    DATA_TIMEOUT_S = float(os.environ.get("DATA_TIMEOUT_S", 15))  # 无数据判离线阈值(调试Day10)
 
 
 # ============================================================
@@ -60,8 +61,21 @@ class DataStore:
         self.buf = {f: deque(maxlen=maxlen) for f in self.FIELDS}
         self.last_ts = 0.0
         self.events = deque(maxlen=500)
-        self.online = False
+        self._online = False          # Broker/状态主题驱动的在线标志
+        self._timed_out = False       # 数据超时看门狗标志
+        self.last_data_wall = None    # 最近一次收到 data 报文的墙钟时间
         os.makedirs(Config.DATA_DIR, exist_ok=True)
+
+    @property
+    def online(self) -> bool:
+        """设备有效在线 = 链路在线 且 数据未超时"""
+        with self.lock:
+            return self._online and not self._timed_out
+
+    @online.setter
+    def online(self, v: bool) -> None:
+        with self.lock:
+            self._online = bool(v)
 
     def add(self, payload: dict) -> bool:
         """写入一条采集数据；数值非法/QoS1重复/时间戳回退的报文丢弃（防数据跳变）"""
@@ -91,6 +105,7 @@ class DataStore:
             for k, v in point.items():
                 self.buf[k].append(v)
             self.last_ts = ts
+        self.last_data_wall = time.time()
         self._append_csv(ts, point)
         return True
 
@@ -147,6 +162,25 @@ class DataStore:
                 "time": datetime.now().strftime("%H:%M:%S"),
                 "level": level, "source": source, "message": message,
             })
+
+    def start_watchdog(self) -> None:
+        """数据超时看门狗: 超过 DATA_TIMEOUT_S 无 data 报文判离线并记 WARN,
+        数据恢复时记 INFO（调试记录 Day10 措施, LWT 覆盖不到的'假在线'场景）"""
+        def _loop():
+            while True:
+                time.sleep(2)
+                lw = self.last_data_wall
+                if lw is None:
+                    continue                       # 尚未收到过任何数据
+                timed_out = (time.time() - lw) > Config.DATA_TIMEOUT_S
+                with self.lock:
+                    prev, self._timed_out = self._timed_out, timed_out
+                if timed_out and not prev:
+                    self.add_event("WARN", "device",
+                                   f"数据超时(>{int(Config.DATA_TIMEOUT_S)}s), 判定节点离线")
+                elif prev and not timed_out:
+                    self.add_event("INFO", "device", "节点数据恢复上报")
+        threading.Thread(target=_loop, daemon=True, name="data-watchdog").start()
 
     def event_list(self, n: int = 50) -> list:
         with self.lock:
@@ -450,6 +484,7 @@ def main():
     parser.add_argument("--port", type=int, default=5000, help="Web 服务端口")
     args = parser.parse_args()
     Config.BROKER_HOST = args.broker
+    store.start_watchdog()
     bridge.start()
     store.add_event("INFO", "system", "看板服务启动")
     print(f"[WEB] http://0.0.0.0:{args.port}  (broker={Config.BROKER_HOST})")
