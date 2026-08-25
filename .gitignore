@@ -1,0 +1,6 @@
+# Python 运行时产物
+__pycache__/
+*.pyc
+
+# 看板运行时数据落盘目录
+Python上位机/data/
