@@ -384,6 +384,8 @@ gauge.setOption({series:[{type:'gauge',min:0,max:25,
 async function refresh(){
   const r = await fetch('/api/realtime'); const d = await r.json();
   if(!d.series || !d.series.ts || !d.series.ts.length) return;
+  const esc = s => String(s).replace(/[&<>"']/g,
+      c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   document.getElementById('net').textContent =
       d.online ? '● MQTT已连接' : '○ 设备离线';
   const put=(id,key)=>{charts[id].setOption({xAxis:{data:d.series.ts.map(t=>t.toFixed(0))},
@@ -396,8 +398,8 @@ async function refresh(){
      均值${x.mean} / 波动${x.std}`).join('<br>');
   const e = await (await fetch('/api/events')).json();
   document.getElementById('events').innerHTML = '<tr><th>时间</th><th>级别</th><th>来源</th><th>内容</th></tr>'
-    + e.map(x=>`<tr><td>${x.time}</td><td class="${x.level}">${x.level}</td>
-       <td>${x.source}</td><td>${x.message}</td></tr>`).join('');
+    + e.map(x=>`<tr><td>${esc(x.time)}</td><td class="${esc(x.level)}">${esc(x.level)}</td>
+       <td>${esc(x.source)}</td><td>${esc(x.message)}</td></tr>`).join('');
 }
 document.getElementById('thr').onsubmit = async (ev)=>{
   ev.preventDefault();
@@ -427,6 +429,16 @@ def index():
     return render_template_string(PAGE)
 
 
+def _minutes_arg(default: int = 60) -> int:
+    """解析并钳制 minutes 查询参数, 非法值回落默认, 防止 500/异常查询"""
+    raw = request.args.get("minutes", default)
+    try:
+        m = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(m, 1440))
+
+
 @app.route("/api/realtime")
 def api_realtime():
     return jsonify(online=store.online, latest=store.latest(),
@@ -435,7 +447,7 @@ def api_realtime():
 
 @app.route("/api/history")
 def api_history():
-    minutes = int(request.args.get("minutes", 60))
+    minutes = _minutes_arg(60)
     df = store.dataframe()
     if df.empty:
         return jsonify(ts=[], temp=[], humi=[], current=[], voltage=[])
@@ -444,7 +456,7 @@ def api_history():
 
 @app.route("/api/stats")
 def api_stats():
-    minutes = int(request.args.get("minutes", 60))
+    minutes = _minutes_arg(60)
     return jsonify(store.stats(minutes))
 
 
@@ -460,7 +472,7 @@ def api_thresholds():
     body = request.get_json(silent=True) or {}
     changed = {}
     for k, v in body.items():
-        if k in alarm.th and isinstance(v, (int, float)) and v > 0:
+        if k in alarm.th and isinstance(v, (int, float)) and 0 < v <= 10000:
             alarm.th[k] = float(v)
             changed[k] = float(v)
     if not changed:
