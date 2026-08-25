@@ -201,6 +201,17 @@ static void OLED_SetPos(uint8_t page, uint8_t col)
     OLED_WriteCmd(0x00 | (col & 0x0F));
 }
 
+static void OLED_GPIO_Init(void)
+{
+    GPIO_InitTypeDef gi;
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
+    gi.GPIO_Pin   = GPIO_Pin_6 | GPIO_Pin_7;
+    gi.GPIO_Mode  = GPIO_Mode_Out_OD;           /* 软件 I2C: 开漏输出, 外部 4.7k 上拉 */
+    gi.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOB, &gi);
+    OLED_SCL_H(); OLED_SDA_H();                 /* 总线空闲态 */
+}
+
 static void OLED_Init(void)
 {
     const uint8_t initCmd[] = {0xAE,0xD5,0x80,0xA8,0x3F,0xD3,0x00,0x40,
@@ -636,6 +647,7 @@ int main(void)
     KEY_BEEP_Init();
     DHT11_Init();
     ADC1_Init();
+    OLED_GPIO_Init();
     OLED_Init();
     OLED_Clear();
     OLED_ShowString(2, 0, "Booting...");
