@@ -8,6 +8,7 @@
  *            4) 三按键(MENU/UP/DOWN)阈值设置, 阈值Flash掉电保存
  *            5) 蜂鸣器+继电器声光报警(3次确认+迟滞, 防误报)
  *            6) ESP8266(AT固件) MQTT 上传 JSON 数据, 断线自动重连
+ *            7) 下行命令: 订阅 cmd 主题, 支持 set_threshold/mute/reboot 并回执
  * 开发环境 : Keil MDK 5.36 + STM32F10x_StdPeriph_Driver V3.5
  * 时钟     : HSE 8MHz -> SYSCLK 72MHz, ADCCLK = 12MHz
  * 作者     : SmartFactory Project   日期: 2026-08
@@ -287,6 +288,16 @@ static void USART2_Init(void)
     ui.USART_HardwareFlowControl = USART_HardwareFlowControl_None;
     USART_Init(USART2, &ui);
     USART_Cmd(USART2, ENABLE);
+    {
+        /* 使能接收中断: 命令下行经 ESP8266 URC 异步到达 */
+        NVIC_InitTypeDef ni;
+        USART_ITConfig(USART2, USART_IT_RXNE, ENABLE);
+        ni.NVIC_IRQChannel                   = USART2_IRQn;
+        ni.NVIC_IRQChannelPreemptionPriority = 1;
+        ni.NVIC_IRQChannelSubPriority        = 1;
+        ni.NVIC_IRQChannelCmd                = ENABLE;
+        NVIC_Init(&ni);
+    }
 }
 
 int fputc(int ch, FILE *f)                      /* printf 重定向到串口1 */
@@ -301,6 +312,27 @@ static void UART2_SendString(const char *s)
     while (*s) {
         USART_SendData(USART2, (uint8_t)*s++);
         while (USART_GetFlagStatus(USART2, USART_FLAG_TXE) == RESET);
+    }
+}
+
+/* ---- USART2 接收环形缓冲: 收 ESP8266 URC(+MQTTSUBRECV 等), 主循环轮询解析 ---- */
+static volatile char     g_rxBuf[512];
+static volatile uint16_t g_rxHead = 0, g_rxTail = 0;
+
+void USART2_IRQHandler(void)
+{
+    uint16_t next;
+    if (USART_GetFlagStatus(USART2, USART_FLAG_ORE)) {          /* 溢出清标志防中断风暴 */
+        (void)USART_ReceiveData(USART2);
+    }
+    if (USART_GetITStatus(USART2, USART_IT_RXNE) != RESET) {
+        next = (uint16_t)((g_rxHead + 1) % sizeof(g_rxBuf));
+        if (next != g_rxTail) {
+            g_rxBuf[g_rxHead] = (char)USART_ReceiveData(USART2);
+            g_rxHead = next;
+        } else {
+            (void)USART_ReceiveData(USART2);                    /* 缓冲满, 丢弃 */
+        }
     }
 }
 
@@ -346,6 +378,9 @@ static void ESP_MQTT_Init(void)
             snprintf(cmd, sizeof(cmd), "AT+MQTTCONN=0,\"%s\",%d,30", BROKER_IP, BROKER_PORT);
             ESP_SendAT(cmd, 4000);
             g_mqttOk = 1;
+            /* 订阅下行命令主题(协议 §2/§3.4) */
+            snprintf(cmd, sizeof(cmd), "AT+MQTTSUB=0,\"factory/" DEVICE_ID "/cmd\",1");
+            ESP_SendAT(cmd, 1000);
             MQTT_PublishStatus("online");
             printf("[NET] MQTT connected, retry=%d\r\n", retry);
             return;
@@ -548,6 +583,111 @@ static void TH_Load(void)
 }
 
 /* ============================================================
+ *                  下行命令处理(协议 §3.4)
+ * 看板经 factory/<id>/cmd 下发 JSON, ESP8266 以 +MQTTSUBRECV
+ * URC 上抛; 此处做最小字符串解析: set_threshold/mute/reboot
+ * ============================================================ */
+#define CMD_NUM_MISSING  (-1000.0f)
+
+/* 在 URC 行中提取 \"<key>\":<number> 的数值, 不存在返回 CMD_NUM_MISSING */
+static float Cmd_ParseNum(const char *line, const char *key)
+{
+    char pat[32];
+    const char *p;
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    p = strstr(line, pat);
+    if (p == NULL) return CMD_NUM_MISSING;
+    p += strlen(pat);
+    while (*p == ' ' || *p == ':') p++;
+    return (float)strtod(p, NULL);
+}
+
+static long Cmd_ParseId(const char *line)
+{
+    const char *p = strstr(line, "\"id\"");
+    if (p == NULL) return 0;
+    p += 4;
+    while (*p == ' ' || *p == ':') p++;
+    return strtol(p, NULL, 10);
+}
+
+static void Cmd_Resp(long id, int result, const char *msg)
+{
+    char payload[96];
+    snprintf(payload, sizeof(payload),
+             "{\"id\":%ld,\"result\":%d,\"msg\":\"%s\"}", id, result, msg);
+    MQTT_Publish("factory/" DEVICE_ID "/cmd_resp", payload);
+}
+
+static void Cmd_Handle(const char *line)
+{
+    long id = Cmd_ParseId(line);
+    float v;
+
+    if (strstr(line, "set_threshold")) {
+        uint8_t hit = 0;
+        v = Cmd_ParseNum(line, "temp_max");
+        if (v > CMD_NUM_MISSING && v >= 10 && v <= 200) { g_th.temp_max = v; hit = 1; }
+        v = Cmd_ParseNum(line, "curr_max");
+        if (v > CMD_NUM_MISSING && v >= 1 && v <= 100) { g_th.curr_max = v; hit = 1; }
+        v = Cmd_ParseNum(line, "volt_max");
+        if (v > CMD_NUM_MISSING && v >= 5 && v <= 1000) { g_th.volt_max = v; hit = 1; }
+        v = Cmd_ParseNum(line, "volt_min");
+        if (v > CMD_NUM_MISSING && v >= 1 &&
+            v <= 1000 && v < g_th.volt_max) { g_th.volt_min = v; hit = 1; }
+        if (hit) {
+            TH_Save();                          /* 与按键设置一致: 写 Flash 掉电保存 */
+            Cmd_Resp(id, 0, "ok");
+            printf("[CMD] set_threshold applied\r\n");
+        } else {
+            Cmd_Resp(id, 1, "param");
+            printf("[CMD] set_threshold rejected\r\n");
+        }
+    } else if (strstr(line, "mute")) {          /* 蜂鸣器消音 */
+        BUZZER_OFF();
+        Cmd_Resp(id, 0, "ok");
+        printf("[CMD] muted\r\n");
+    } else if (strstr(line, "reboot")) {        /* 软复位 */
+        Cmd_Resp(id, 0, "ok");
+        printf("[CMD] rebooting...\r\n");
+        DelayMs(200);                           /* 给 UART 发送留时间 */
+        NVIC_SystemReset();
+    } else {
+        Cmd_Resp(id, 1, "unknown");
+        printf("[CMD] unknown type\r\n");
+    }
+}
+
+#define CMD_URC_PREFIX   "+MQTTSUBRECV:"
+#define CMD_TOPIC_SUFFIX "/cmd"
+
+/* 主循环轮询: 从环形缓冲拼行, 命中 cmd 主题的 URC 交命令处理 */
+static void ESP_RxPoll(void)
+{
+    static char     g_lineBuf[256];
+    static uint16_t g_lineLen = 0;
+
+    while (g_rxTail != g_rxHead) {
+        char c = g_rxBuf[g_rxTail];
+        g_rxTail = (uint16_t)((g_rxTail + 1) % sizeof(g_rxBuf));
+        if (c == '\n') {
+            g_lineBuf[g_lineLen] = '\0';
+            if (strstr(g_lineBuf, CMD_URC_PREFIX) != NULL &&
+                strstr(g_lineBuf, "factory/" DEVICE_ID CMD_TOPIC_SUFFIX) != NULL) {
+                Cmd_Handle(g_lineBuf);
+            }
+            g_lineLen = 0;
+        } else if (c != '\r') {
+            if (g_lineLen < sizeof(g_lineBuf) - 1) {
+                g_lineBuf[g_lineLen++] = c;
+            } else {
+                g_lineLen = 0;                  /* 超长行丢弃重来 */
+            }
+        }
+    }
+}
+
+/* ============================================================
  *                       报警判定(防误报)
  * 规则: 连续3个采样周期越限才报警; 恢复条件加入5%迟滞回差
  * ============================================================ */
@@ -690,6 +830,8 @@ int main(void)
     while (1) {
         uint32_t nowSec = g_msTicks / 1000u;    /* 上电秒数 */
         g_uptime = nowSec;
+
+        ESP_RxPoll();                           /* 处理下行命令 URC */
 
         if (nowSec != lastOled) { lastOled = nowSec; OLED_ShowMain(); }   /* 1s 刷屏 */
 
