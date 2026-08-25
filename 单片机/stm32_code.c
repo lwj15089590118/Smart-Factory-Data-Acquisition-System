@@ -570,8 +570,8 @@ static void OLED_ShowMain(void)
 {
     char line[24];
     OLED_ShowString(0,  0, "SmartFactory " FW_VERSION);
-    snprintf(line, sizeof(line), "T:%2d.%dC H:%2d%%",
-             (int)g_sensor.temp, (int)((g_sensor.humi)));
+    snprintf(line, sizeof(line), "T:%.1fC H:%.0f%%",
+             g_sensor.temp, g_sensor.humi);
     OLED_ShowString(2, 0, line);
     snprintf(line, sizeof(line), "I:%d.%02dA U:%d.%dV",
              (int)g_sensor.current, (int)(g_sensor.current * 100) % 100,
