@@ -472,7 +472,9 @@ def api_thresholds():
     body = request.get_json(silent=True) or {}
     changed = {}
     for k, v in body.items():
-        if k in alarm.th and isinstance(v, (int, float)) and 0 < v <= 10000:
+        # 注意 bool 是 int 子类, JSON true/false 需显式排除
+        if k in alarm.th and isinstance(v, (int, float)) \
+                and not isinstance(v, bool) and 0 < v <= 10000:
             alarm.th[k] = float(v)
             changed[k] = float(v)
     if not changed:
