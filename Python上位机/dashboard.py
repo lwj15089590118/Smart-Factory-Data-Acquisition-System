@@ -43,6 +43,7 @@ class Config:
     TOPIC_ALARM   = f"factory/{DEVICE_ID}/alarm"
     TOPIC_STATUS  = f"factory/{DEVICE_ID}/status"
     TOPIC_CMD     = f"factory/{DEVICE_ID}/cmd"
+    TOPIC_CMD_RESP = f"factory/{DEVICE_ID}/cmd_resp"
     HISTORY_LEN   = 7200          # 环形缓冲容量（约 2 小时, 5s/条）
     DATA_DIR      = os.path.join(os.path.dirname(__file__), "data")
     CSV_PATH      = os.path.join(DATA_DIR, "history.csv")
@@ -250,7 +251,7 @@ class MqttBridge:
     def _on_connect(self, client, userdata, flags, rc):
         print(f"[MQTT] 已连接 Broker, rc={rc}")
         client.subscribe([(Config.TOPIC_DATA, 1), (Config.TOPIC_ALARM, 1),
-                          (Config.TOPIC_STATUS, 1)])
+                          (Config.TOPIC_STATUS, 1), (Config.TOPIC_CMD_RESP, 1)])
         client.publish("factory/dashboard/status",
                        json.dumps({"state": "online"}), qos=1, retain=True)
         self.store.online = True
@@ -279,6 +280,10 @@ class MqttBridge:
             self.store.add_event("ALARM", "device",
                                  f"节点报警 code={payload.get('alarm')} "
                                  f"T={payload.get('temp')} I={payload.get('current')}")
+        elif msg.topic == Config.TOPIC_CMD_RESP:
+            self.store.add_event("INFO", "cmd_resp",
+                                 f"命令回执 id={payload.get('id')} "
+                                 f"result={payload.get('result')} {payload.get('msg', '')}")
         elif msg.topic == Config.TOPIC_STATUS:
             state = payload.get("state", "unknown")
             self.store.online = (state == "online")
