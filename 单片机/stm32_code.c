@@ -409,6 +409,10 @@ static uint16_t ADC_ReadFiltered(uint8_t ch)
         for (j = 0; j < 4 - i; j++)
             if (s[j] > s[j+1]) { uint16_t t = s[j]; s[j] = s[j+1]; s[j+1] = t; }
     g_adcWin[g_winIdx & 7] = s[2];
+    if (g_winIdx == 0) {                        /* 首次采样播种整窗, 避免开机曲线凹陷 */
+        uint8_t n;
+        for (n = 0; n < 8; n++) g_adcWin[n] = s[2];
+    }
     g_winIdx++;
     for (i = 0; i < 8; i++) sum += g_adcWin[i];
     return (uint16_t)(sum >> 3);
@@ -420,7 +424,7 @@ static void Current_ZeroCal(void)               /* 上电空载零点校准 */
     uint8_t  i;
     printf("[CAL] current zero calibrating, keep load OFF...\r\n");
     for (i = 0; i < 64; i++) sum += ADC_ReadCh(ADC_Channel_1);
-    g_iZeroVolt = sum / 64 * VREF / 4095.0f;
+    g_iZeroVolt = sum / 64.0f * VREF / 4095.0f;   /* 浮点均值, 避免整除截断误差 */
     printf("[CAL] zero point = %.3f V\r\n", g_iZeroVolt);
 }
 
