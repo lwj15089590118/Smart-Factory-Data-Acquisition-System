@@ -7,8 +7,9 @@
  *            3) OLED(SSD1306) 本地显示
  *            4) 三按键(MENU/UP/DOWN)阈值设置, 阈值Flash掉电保存
  *            5) 蜂鸣器+继电器声光报警(3次确认+迟滞, 防误报)
- *            6) ESP8266(AT固件) MQTT 上传 JSON 数据, 断线自动重连
+ *            6) ESP8266(AT固件) MQTT 上传 JSON 数据, 断线 URC 检测 + 自动重连
  *            7) 下行命令: 订阅 cmd 主题, 支持 set_threshold/mute/reboot 并回执
+ *            8) 独立看门狗(约2s) + DHT11 时序超时, 防总线/链路异常挂死
  * 开发环境 : Keil MDK 5.36 + STM32F10x_StdPeriph_Driver V3.5
  * 时钟     : HSE 8MHz -> SYSCLK 72MHz, ADCCLK = 12MHz
  * 作者     : SmartFactory Project   日期: 2026-08
@@ -89,8 +90,10 @@ static uint8_t       g_alarmCnt[3]  = {0};      /* 越限连续确认计数   */
 static uint8_t       g_mqttOk       = 0;        /* MQTT 连接状态      */
 static uint32_t      g_uptime       = 0;        /* 上电秒数           */
 static float         g_iZeroVolt    = 2.5f;     /* 电流通道零点(V), 上电自校准 */
-static uint16_t      g_adcWin[8]    = {0};      /* 滑动平均窗口       */
-static uint8_t       g_winIdx       = 0;
+#define ADC_FILT_DEPTH   8                      /* 滑动平均窗口深度(与原设计一致) */
+#define ADC_FILT_CH_NUM  2                      /* 参与滤波通道数: 电流/电压各一组 */
+static uint16_t g_adcWin[ADC_FILT_CH_NUM][ADC_FILT_DEPTH] = {{0}}; /* 按通道隔离的滑动窗口 */
+static uint8_t  g_winIdx[ADC_FILT_CH_NUM]       = {0};  /* 每通道独立写索引 */
 static volatile uint32_t g_msTicks  = 0;        /* 毫秒时基(SysTick中断维护) */
 
 #define VREF            3.300f                  /* ADC 基准电压        */
@@ -336,15 +339,71 @@ void USART2_IRQHandler(void)
     }
 }
 
-/* 发送 AT 指令并粗等待应答(简化版: 延时法, 完整工程可用环形缓冲+匹配OK) */
+/* ============================================================
+ *          独立看门狗 IWDG(约 2s, LSI 40kHz)
+ * 用寄存器直写, 不依赖工程是否提供 stm32f10x_iwdg.h;
+ * 喂狗点: 主循环末尾(确认处) + 所有 AT 长等待内部(防止重连期间误复位)
+ * ============================================================ */
+#define IWDG_FEED()     (IWDG->KR = 0xAAAA)     /* 重载计数(喂狗) */
+
+static void IWDG_Init(void)
+{
+    uint32_t t = 1000000u;                      /* 有界等待, 防 LSI 异常卡死 */
+    IWDG->KR  = 0xCCCC;                         /* 启动 IWDG(硬件自动开 LSI) */
+    IWDG->KR  = 0x5555;                         /* 解除 PR/RLR 写保护 */
+    IWDG->PR  = 0x06;                           /* 分频 64: 40kHz/64 = 625Hz */
+    IWDG->RLR = 1250;                           /* 1250/625 = 2s(LSI 有容差) */
+    while (((IWDG->SR & 3u) != 0u) && --t);     /* 等 PVU/RVU 同步完成(有界) */
+    IWDG_FEED();
+}
+
+/* 在 [start, head) 未消费接收区查找 needle(只读不消费, 数据留给 ESP_RxPoll
+   统一拼行, 避免吞掉 +MQTTSUBRECV 命令 URC), 找到返回 1 */
+static uint8_t ESP_RxScan(const char *needle, uint16_t start)
+{
+    uint16_t idx = start;
+    uint16_t i = 0, len = (uint16_t)strlen(needle);
+    while (idx != g_rxHead) {
+        char c = g_rxBuf[idx];
+        idx = (uint16_t)((idx + 1) % sizeof(g_rxBuf));
+        if (c == needle[i]) {
+            if (++i == len) return 1;
+        } else {
+            i = (c == needle[0]) ? 1 : 0;       /* 失配回退到可能的重复首字符 */
+        }
+    }
+    return 0;
+}
+
+/* 阻塞等待 needle 出现(期间喂狗), 超时返回 0 */
+static uint8_t ESP_RxWaitToken(const char *needle, uint16_t start, uint32_t timeoutMs)
+{
+    uint32_t start_ms = g_msTicks;
+    while ((g_msTicks - start_ms) < timeoutMs) {
+        if (ESP_RxScan(needle, start)) return 1;
+        IWDG_FEED();
+    }
+    return 0;
+}
+
+/* 发送 AT 指令并校验应答: 收到 OK 返回 1, ERROR/FAIL/超时返回 0
+   (应答只认本命令发出之后的字节: base 之前的旧数据不参与匹配,
+    且应答数据不在此消费, 统一留给 ESP_RxPoll 拼行) */
 static uint8_t ESP_SendAT(const char *cmd, uint32_t waitMs)
 {
     char buf[128];
+    uint16_t base = g_rxHead;
+    uint32_t start = g_msTicks;
     snprintf(buf, sizeof(buf), "%s\r\n", cmd);
     UART2_SendString(buf);
     printf("[AT] %s\r\n", cmd);
-    DelayMs(waitMs);
-    return 1;
+    while ((g_msTicks - start) < waitMs) {
+        if (ESP_RxScan("\r\nOK\r\n", base)) return 1;
+        if (ESP_RxScan("\r\nERROR\r\n", base) ||
+            ESP_RxScan("\r\nFAIL\r\n", base)) return 0;
+        IWDG_FEED();
+    }
+    return 0;                                   /* 超时按失败处理, 交上层重试 */
 }
 
 /* 发布节点在线状态到 factory/<id>/status, retain=1(协议 §3.3) */
@@ -364,38 +423,73 @@ static void ESP_MQTT_Init(void)
 {
     char cmd[192];
     uint8_t retry;
+    uint16_t base;
     for (retry = 0; retry < 3; retry++) {
         ESP_SendAT("AT+RST", 3000);
         ESP_SendAT("AT+CWMODE=1", 500);
         snprintf(cmd, sizeof(cmd), "AT+CWJAP=\"%s\",\"%s\"", WIFI_SSID, WIFI_PASS);
-        if (ESP_SendAT(cmd, 8000)) {
-            ESP_SendAT("AT+MQTTUSERCFG=0,1,\"" DEVICE_ID "\",\"" MQTT_USER "\",\"" MQTT_PASS "\",0,0,\"\"", 1000);
-            /* keepalive=30s + 遗嘱 LWT: 异常掉线由 Broker 代发 retained offline(协议 §1/§3.3) */
-            snprintf(cmd, sizeof(cmd),
-                     "AT+MQTTCONNCFG=0,30,1,\"factory/" DEVICE_ID "/status\","
-                     "\"{\\\"deviceId\\\":\\\"" DEVICE_ID "\\\",\\\"state\\\":\\\"offline\\\"}\",1,1");
-            ESP_SendAT(cmd, 1000);
-            snprintf(cmd, sizeof(cmd), "AT+MQTTCONN=0,\"%s\",%d,30", BROKER_IP, BROKER_PORT);
-            ESP_SendAT(cmd, 4000);
-            g_mqttOk = 1;
-            /* 订阅下行命令主题(协议 §2/§3.4) */
-            snprintf(cmd, sizeof(cmd), "AT+MQTTSUB=0,\"factory/" DEVICE_ID "/cmd\",1");
-            ESP_SendAT(cmd, 1000);
-            MQTT_PublishStatus("online");
-            printf("[NET] MQTT connected, retry=%d\r\n", retry);
-            return;
-        }
+        if (!ESP_SendAT(cmd, 8000)) continue;   /* WiFi 入网失败, 直接下一轮重试 */
+        ESP_SendAT("AT+MQTTUSERCFG=0,1,\"" DEVICE_ID "\",\"" MQTT_USER "\",\"" MQTT_PASS "\",0,0,\"\"", 1000);
+        /* keepalive=30s + 遗嘱 LWT: 异常掉线由 Broker 代发 retained offline(协议 §1/§3.3) */
+        snprintf(cmd, sizeof(cmd),
+                 "AT+MQTTCONNCFG=0,30,1,\"factory/" DEVICE_ID "/status\","
+                 "\"{\\\"deviceId\\\":\\\"" DEVICE_ID "\\\",\\\"state\\\":\\\"offline\\\"}\",1,1");
+        ESP_SendAT(cmd, 1000);
+        base = g_rxHead;                        /* 应答基准: +MQTTCONNECTED URC 可能紧随 OK 到达 */
+        snprintf(cmd, sizeof(cmd), "AT+MQTTCONN=0,\"%s\",%d,30", BROKER_IP, BROKER_PORT);
+        if (!ESP_SendAT(cmd, 4000)) continue;               /* 命令被拒 */
+        if (!ESP_RxWaitToken("+MQTTCONNECTED", base, 5000)) continue;  /* 未连上 Broker */
+        g_mqttOk = 1;
+        /* 订阅下行命令主题(协议 §2/§3.4) */
+        snprintf(cmd, sizeof(cmd), "AT+MQTTSUB=0,\"factory/" DEVICE_ID "/cmd\",1");
+        ESP_SendAT(cmd, 1000);
+        MQTT_PublishStatus("online");
+        printf("[NET] MQTT connected, retry=%d\r\n", retry);
+        return;
     }
     g_mqttOk = 0;
     printf("[NET] MQTT connect FAILED, will retry in main loop\r\n");
 }
 
-static void MQTT_Publish(const char *topic, const char *payload)
+/* 数据/报警上行: JSON 含大量双引号且约 115~140 字节, 超过 AT+MQTTPUB 的 64 字节
+   参数上限且转义易错, 改走 AT+MQTTPUBRAW 裸数据模式:
+   发命令 -> 等 '>' 提示符 -> 发定长裸数据(引号无需转义) -> 等 +MQTTPUB:OK/FAIL
+   注: ESP-AT v2.x 的 MQTTPUBRAW 按声明长度收满即发布, 数据末尾不需要 0x1A
+   (0x1A 是 TCP 透传模式的结束符; 若计入长度会混入 payload 破坏 JSON) */
+#define MQTT_PUB_MAX_LEN 192                    /* 上行 payload 长度上限(与调用方缓冲一致) */
+static uint8_t MQTT_Publish(const char *topic, const char *payload)
 {
-    char cmd[300];
-    if (!g_mqttOk) return;
-    snprintf(cmd, sizeof(cmd), "AT+MQTTPUB=0,\"%s\",\"%s\",1,0", topic, payload);
-    ESP_SendAT(cmd, 300);
+    char cmd[96];
+    uint16_t base;
+    uint32_t len, start;
+    if (!g_mqttOk) return 0;
+    len = (uint32_t)strlen(payload);
+    if (len == 0 || len > MQTT_PUB_MAX_LEN) return 0;   /* 长度显式检查, 防缓冲区溢出 */
+    base = g_rxHead;                            /* 应答基准: '>' 紧随 OK, 两次等待须同源 */
+    snprintf(cmd, sizeof(cmd), "AT+MQTTPUBRAW=0,\"%s\",%lu,1,0",
+             topic, (unsigned long)len);
+    UART2_SendString(cmd);
+    UART2_SendString("\r\n");
+    printf("[AT] %s\r\n", cmd);
+    start = g_msTicks;
+    while ((g_msTicks - start) < 1000u) {       /* 等命令应答 OK */
+        if (ESP_RxScan("\r\nOK\r\n", base)) break;
+        if (ESP_RxScan("\r\nERROR\r\n", base) ||
+            ESP_RxScan("\r\nFAIL\r\n", base)) return 0;
+        IWDG_FEED();
+    }
+    if (!ESP_RxScan(">", base)) {               /* 等 '>' 提示符进入数据模式 */
+        g_mqttOk = 0;                           /* 视为链路异常, 交主循环 30s 重连 */
+        printf("[NET] MQTTPUBRAW no '>' prompt\r\n");
+        return 0;
+    }
+    UART2_SendString(payload);
+    if (!ESP_RxWaitToken("+MQTTPUB:OK", base, 3000)) {
+        g_mqttOk = 0;
+        printf("[NET] publish FAIL, mark for reconnect\r\n");
+        return 0;
+    }
+    return 1;
 }
 
 /* ============================================================
@@ -433,23 +527,31 @@ static uint16_t ADC_ReadCh(uint8_t ch)
     return ADC_GetConversionValue(ADC1);
 }
 
+/* 通道号 -> 滤波窗口槽位: 电流(ADC_Channel_1)与电压(ADC_Channel_4)各自独立一组窗口,
+   避免两路交替采样共用同一窗口导致读数互相串扰 */
+static uint8_t ADC_FiltSlot(uint8_t ch)
+{
+    return (uint8_t)((ch == ADC_Channel_4) ? 1 : 0);
+}
+
 /* 采集5次取中值, 再做8点滑动平均 —— 解决现场数据跳变(见调试记录Day4) */
 static uint16_t ADC_ReadFiltered(uint8_t ch)
 {
     uint16_t s[5];
-    uint8_t  i, j;
+    uint8_t  i, j, slot;
     uint32_t sum = 0;
+    slot = ADC_FiltSlot(ch);
     for (i = 0; i < 5; i++) { s[i] = ADC_ReadCh(ch); DelayUs(200); }
     for (i = 0; i < 4; i++)                     /* 冒泡排序取中值 */
         for (j = 0; j < 4 - i; j++)
             if (s[j] > s[j+1]) { uint16_t t = s[j]; s[j] = s[j+1]; s[j+1] = t; }
-    g_adcWin[g_winIdx & 7] = s[2];
-    if (g_winIdx == 0) {                        /* 首次采样播种整窗, 避免开机曲线凹陷 */
+    g_adcWin[slot][g_winIdx[slot] & (ADC_FILT_DEPTH - 1)] = s[2];
+    if (g_winIdx[slot] == 0) {                  /* 首次采样播种整窗, 避免开机曲线凹陷 */
         uint8_t n;
-        for (n = 0; n < 8; n++) g_adcWin[n] = s[2];
+        for (n = 0; n < ADC_FILT_DEPTH; n++) g_adcWin[slot][n] = s[2];
     }
-    g_winIdx++;
-    for (i = 0; i < 8; i++) sum += g_adcWin[i];
+    g_winIdx[slot]++;
+    for (i = 0; i < ADC_FILT_DEPTH; i++) sum += g_adcWin[slot][i];
     return (uint16_t)(sum >> 3);
 }
 
@@ -482,31 +584,48 @@ static void DHT11_Init(void)
     DHT11_HIGH();
 }
 
-static uint8_t DHT11_ReadByte(void)
+/* 等待数据线变为指定电平(RESET/SET), 基于 SysTick 计数约 200us 超时:
+   返回 0=等到, 1=超时。防止数据线受扰钳死导致 while 死循环挂死主循环 */
+static uint8_t DHT11_Wait(uint8_t level)
+{
+    uint32_t start = SysTick->VAL;
+    uint32_t ticks = 200 * 72;                  /* 200us @72MHz */
+    uint32_t delta, now;
+    do {
+        if (DHT11_READ() == level) return 0;
+        now   = SysTick->VAL;
+        delta = (start >= now) ? (start - now)
+                               : (start + (SysTick->LOAD + 1) - now);
+    } while (delta < ticks);
+    return 1;
+}
+
+static uint8_t DHT11_ReadByte(uint8_t *out)     /* 返回 0 成功, 1 等待超时 */
 {
     uint8_t i, byte = 0;
     for (i = 0; i < 8; i++) {
-        while (DHT11_READ() == RESET);          /* 等 50us 低电平结束 */
+        if (DHT11_Wait(SET)) return 1;          /* 等 50us 低电平结束(线变高) */
         DelayUs(40);                            /* 40us 后判断电平 */
         byte <<= 1;
-        if (DHT11_READ() != RESET) { byte |= 1; while (DHT11_READ() != RESET); }
+        if (DHT11_READ() != RESET) {
+            byte |= 1;
+            if (DHT11_Wait(RESET)) return 1;    /* 等高电平结束 */
+        }
     }
-    return byte;
+    *out = byte;
+    return 0;
 }
 
 static uint8_t DHT11_Read(float *temp, float *humi)
 {
-    uint8_t buf[5];
+    uint8_t buf[5], i;
     DHT11_LOW();  DelayMs(20);                  /* 起始信号 >18ms */
     DHT11_HIGH(); DelayUs(30);
     if (DHT11_READ() != RESET) return 1;        /* 无应答 */
-    while (DHT11_READ() == RESET);              /* 83us 低 */
-    while (DHT11_READ() != RESET);              /* 87us 高 */
-    buf[0] = DHT11_ReadByte();                  /* 湿度整数 */
-    buf[1] = DHT11_ReadByte();                  /* 湿度小数 */
-    buf[2] = DHT11_ReadByte();                  /* 温度整数 */
-    buf[3] = DHT11_ReadByte();                  /* 温度小数 */
-    buf[4] = DHT11_ReadByte();                  /* 校验和 */
+    if (DHT11_Wait(SET)) return 3;              /* 83us 低, 超时 */
+    if (DHT11_Wait(RESET)) return 3;            /* 87us 高, 超时 */
+    for (i = 0; i < 5; i++)
+        if (DHT11_ReadByte(&buf[i])) return 3;  /* 位等待超时 */
     if ((uint8_t)(buf[0]+buf[1]+buf[2]+buf[3]) != buf[4]) return 2;
     *humi = buf[0] + buf[1] * 0.1f;
     *temp = buf[2] + buf[3] * 0.1f;
@@ -672,6 +791,14 @@ static void ESP_RxPoll(void)
         g_rxTail = (uint16_t)((g_rxTail + 1) % sizeof(g_rxBuf));
         if (c == '\n') {
             g_lineBuf[g_lineLen] = '\0';
+            /* 断线 URC: WiFi 掉网或 MQTT 断开, 清连接标志使主循环 30s 重连生效 */
+            if (strstr(g_lineBuf, "WIFI DISCONNECT") != NULL ||
+                strstr(g_lineBuf, "+MQTTDISCONNECTED") != NULL) {
+                if (g_mqttOk) {
+                    g_mqttOk = 0;
+                    printf("[NET] disconnect URC, will reconnect\r\n");
+                }
+            }
             if (strstr(g_lineBuf, CMD_URC_PREFIX) != NULL &&
                 strstr(g_lineBuf, "factory/" DEVICE_ID CMD_TOPIC_SUFFIX) != NULL) {
                 Cmd_Handle(g_lineBuf);
@@ -825,6 +952,7 @@ int main(void)
     Buzzer_Beep(50);                            /* 上电自检提示音 */
     TH_Load();
     Current_ZeroCal();
+    IWDG_Init();                                /* 使能独立看门狗(约2s): AT长等待与主循环处喂狗 */
     ESP_MQTT_Init();
     OLED_Clear();
 
@@ -857,5 +985,6 @@ int main(void)
         }
 
         Key_Handle(KEY_Scan());
+        IWDG_FEED();                            /* 主循环确认处喂狗: 采样/报警/上传/按键均已完成 */
     }
 }

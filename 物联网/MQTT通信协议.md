@@ -11,7 +11,7 @@
 | 项目 | 约定 |
 |------|------|
 | ClientID | 节点：`node1`；看板：`dashboard-server`；命名唯一，防止互踢 |
-| 用户认证 | 用户名 `sfda` / 密码 `sfda123`（生产环境务必改为强口令） |
+| 用户认证 | 用户名 `sfda` / 密码 `sfda123`（仅供本地演示，看板侧可用环境变量 `MQTT_USER / MQTT_PASS` 注入覆盖，生产环境务必改为强口令） |
 | QoS | 数据上行 QoS1（至少一次）；命令下行 QoS1；状态主题 retain=1 |
 | 遗嘱 LWT | 节点掉线时由 Broker 代发 `offline`，看板据此显示离线 |
 | 心跳 | keepalive=30s；节点 30s 未连上 Broker 自动重连 |
@@ -81,8 +81,10 @@
 ### 3.3 在线状态 `factory/node1/status`（retain=1）
 
 ```json
-{ "deviceId": "node1", "state": "online", "fw": "v1.2.0", "uptime": 12 }
+{ "deviceId": "node1", "state": "online", "fw": "v1.2.0" }
 ```
+
+> 固件 status 报文不含 `uptime`（与固件 `MQTT_PublishStatus` 实际字段一致）。
 
 掉线时 Broker 代发遗嘱：
 
@@ -103,6 +105,8 @@
 }
 ```
 
+> `id` 由看板侧**自增生成**（1, 2, 3, …），固件回执 `cmd_resp` 原样带回，用于请求-回执对账。
+
 命令回执 `factory/node1/cmd_resp`：
 
 ```json
@@ -116,7 +120,6 @@
 | `set_threshold` | temp_max / curr_max / volt_max / volt_min | 写阈值并 Flash 保存 |
 | `mute` | 无 | 蜂鸣器消音 |
 | `reboot` | 无 | 节点软复位 |
-| `set_upload` | `{"interval": 10}` | 修改上传周期（秒） |
 
 ## 4. 报警位图速查
 

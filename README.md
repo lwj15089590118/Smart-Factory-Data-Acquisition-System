@@ -11,7 +11,7 @@
 
 本项目是一套面向小型工厂/车间的**多参数数据采集与可视化系统**。以 **STM32F103C8T6** 为核心采集节点，实时采集环境**温湿度（DHT11）**、负载**电流（ACS712 霍尔互感器）**与母线**电压（分压电阻网络）**，数据经 **ESP8266（AT 固件）通过 MQTT 协议**上传至 Broker；上位机使用 **Python（Flask + paho-mqtt + pandas）** 订阅数据，并通过 **ECharts** 渲染 Web 实时曲线看板，支持阈值设置、越限报警、历史统计与 CSV 导出。
 
-现场侧同时提供 **OLED 本地显示、三按键阈值设置、蜂鸣器/继电器声光报警**，断网时本地照常采集与报警，网络恢复后自动重连补传（最新值）。
+现场侧同时提供 **OLED 本地显示、三按键阈值设置、蜂鸣器/继电器声光报警**，断网时本地照常采集与报警，网络恢复后自动重连（30s 周期），不额外做历史数据补传。
 
 ### 核心特性
 
@@ -31,7 +31,7 @@ flowchart LR
         A[DHT11 温湿度传感器] -->|单总线| M
         B[ACS712-20A 电流互感器] -->|模拟电压 2.5V±0.1V/A| M
         C[分压电阻网络 100k/4.7k] -->|模拟电压| M
-        K[三按键 阈值设置] -->|GPIO 中断扫描| M
+        K[三按键 阈值设置] -->|GPIO 轮询扫描| M
         M[STM32F103C8T6<br>采集节点<br>中值滤波/滑动平均/报警判定]
     end
     M -->|软件 I2C PB6/PB7| O[0.96寸 OLED<br>本地显示]
@@ -55,11 +55,12 @@ Smart-Factory-Data-Acquisition-System/
 │   └── 硬件接线图.md                # 全部引脚连接说明（文字 + ASCII 图）
 ├── Python上位机/
 │   ├── dashboard.py                 # Web 看板（Flask + ECharts + MQTT 订阅）
-│   └── requirements.txt             # Python 依赖清单
+│   ├── requirements.txt             # Python 依赖清单
+│   └── tests/                       # pytest 单元测试（数据/报警/协议一致性）
 ├── 物联网/
 │   └── MQTT通信协议.md              # 主题设计、JSON 数据格式、QoS/LWT 规范
 ├── 电气图纸/
-│   └── 数据采集柜布局图.dwg         # 采集柜布局（纯文本字符画模拟）
+│   └── 数据采集柜布局图.txt         # 采集柜布局（纯文本字符画模拟，非 CAD 二进制）
 ├── 调试日志/
 │   └── 调试记录.md                  # 15 天调试记录（数据跳变/通信断连/阈值误报）
 ├── 用户手册/
@@ -86,15 +87,31 @@ Smart-Factory-Data-Acquisition-System/
 
 ### 1. 部署 MQTT Broker（可选任意一台内网服务器）
 
+固件与看板默认按用户名 `sfda` / 密码 `sfda123` 连接（仅供本地演示；看板侧可用环境变量 `MQTT_USER / MQTT_PASS` 注入覆盖，设为空字符串即匿名连接）。两种常见配置任选其一：
+
+**方式 A：Docker 部署 EMQX 并创建用户**
+
 ```bash
-# Docker 一键部署 EMQX
 docker run -d --name emqx -p 1883:1883 -p 18083:18083 emqx/emqx:latest
+# 浏览器打开 http://<服务器IP>:18083（默认 admin/public，建议先改口令）
+# 「访问控制 → 认证 → Internal Database」添加用户 sfda / sfda123
+```
+
+**方式 B：mosquitto 匿名 Broker（仅限内网测试）**
+
+```bash
+# /etc/mosquitto/mosquitto.conf 追加:
+#   listener 1883 0.0.0.0
+#   allow_anonymous true
+mosquitto -c /etc/mosquitto/mosquitto.conf &
+# 看板以空凭据匿名连接:
+MQTT_USER="" MQTT_PASS="" python dashboard.py --broker 127.0.0.1
 ```
 
 ### 2. 烧录单片机程序
 
 1. 用 Keil MDK 打开工程，将 `单片机/stm32_code.c` 加入工程（需 STM32F10x 标准外设库与 `oledfont.h` 字库文件）；
-2. 修改代码顶部的 `WIFI_SSID / WIFI_PASS / BROKER_IP` 宏；
+2. 修改代码顶部的 `WIFI_SSID / WIFI_PASS / BROKER_IP / MQTT_USER / MQTT_PASS` 宏；
 3. 编译烧录至 STM32F103C8T6。
 
 ### 3. 启动上位机看板
@@ -104,6 +121,13 @@ cd Python上位机
 pip install -r requirements.txt
 python dashboard.py --broker 192.168.1.100
 # 浏览器访问 http://127.0.0.1:5000
+```
+
+可选：运行上位机单元测试（数据去重/回退、报警状态机、协议两端一致性回放）：
+
+```bash
+cd Python上位机
+python -m pytest tests/ -q
 ```
 
 ## 六、硬件清单（BOM 摘要）
@@ -124,7 +148,7 @@ python dashboard.py --broker 192.168.1.100
 
 - 通信协议规范：[物联网/MQTT通信协议.md](物联网/MQTT通信协议.md)
 - 硬件接线：[单片机/硬件接线图.md](单片机/硬件接线图.md)
-- 电气布局：[电气图纸/数据采集柜布局图.dwg](电气图纸/数据采集柜布局图.dwg)（纯文本模拟）
+- 电气布局：[电气图纸/数据采集柜布局图.txt](电气图纸/数据采集柜布局图.txt)（纯文本字符画模拟）
 - 操作手册：[用户手册/操作说明书.md](用户手册/操作说明书.md)
 - 调试档案：[调试日志/调试记录.md](调试日志/调试记录.md)
 

@@ -35,6 +35,7 @@ from flask import Flask, Response, jsonify, render_template_string, request
 class Config:
     BROKER_HOST   = os.environ.get("MQTT_HOST", "127.0.0.1")
     BROKER_PORT   = int(os.environ.get("MQTT_PORT", 1883))
+    # 凭据默认值仅供本地演示/联调使用, 生产环境必须用环境变量注入覆盖
     MQTT_USER     = os.environ.get("MQTT_USER", "sfda")
     MQTT_PASS     = os.environ.get("MQTT_PASS", "sfda123")
     CLIENT_ID     = "dashboard-server"
@@ -44,7 +45,7 @@ class Config:
     TOPIC_STATUS  = f"factory/{DEVICE_ID}/status"
     TOPIC_CMD     = f"factory/{DEVICE_ID}/cmd"
     TOPIC_CMD_RESP = f"factory/{DEVICE_ID}/cmd_resp"
-    HISTORY_LEN   = 7200          # 环形缓冲容量（约 2 小时, 5s/条）
+    HISTORY_LEN   = 7200          # 环形缓冲容量（约 10 小时, 5s/条）
     DATA_DIR      = os.path.join(os.path.dirname(__file__), "data")
     CSV_PATH      = os.path.join(DATA_DIR, "history.csv")
     TS_REORDER_TOLERANCE_S = 5.0  # uptime 回退容忍窗口: 其内视为 QoS1 重复/乱序丢弃
@@ -247,6 +248,13 @@ class MqttBridge:
         self.client.on_message = self._on_message
         self.client.on_disconnect = self._on_disconnect
         self._mqtt_pub_lock = threading.Lock()
+        self._cmd_seq = 0              # 下行命令自增 id（协议 §3.4, 固件回执原样带回）
+
+    def next_cmd_id(self) -> int:
+        """生成自增的下行命令 id, 供 cmd_resp 回执对账"""
+        with self._mqtt_pub_lock:
+            self._cmd_seq += 1
+            return self._cmd_seq
 
     def _on_connect(self, client, userdata, flags, rc):
         print(f"[MQTT] 已连接 Broker, rc={rc}")
@@ -277,6 +285,10 @@ class MqttBridge:
                             "deviceId": Config.DEVICE_ID, "source": "dashboard",
                             "message": text, "time": datetime.now().isoformat()})
         elif msg.topic == Config.TOPIC_ALARM:
+            if payload.get("source") == "dashboard":
+                # 看板自发布报警经 Broker 回流, 不是节点上报, 跳过 device 格式解析,
+                # 避免产生"节点报警 code=None"的假事件
+                return
             self.store.add_event("ALARM", "device",
                                  f"节点报警 code={payload.get('alarm')} "
                                  f"T={payload.get('temp')} I={payload.get('current')}")
@@ -479,10 +491,10 @@ def api_thresholds():
             changed[k] = float(v)
     if not changed:
         return jsonify(error="参数非法"), 400
-    # 同步下发到单片机节点（MQTT 命令主题）
+    # 同步下发到单片机节点（MQTT 命令主题, id 自增便于回执对账）
     bridge.publish(Config.TOPIC_CMD,
-                   {"type": "set_threshold", "params": changed,
-                    "time": datetime.now().isoformat()})
+                   {"id": bridge.next_cmd_id(), "type": "set_threshold",
+                    "params": changed, "time": datetime.now().isoformat()})
     store.add_event("INFO", "web", f"阈值已修改: {changed}")
     return jsonify(ok=True, thresholds=alarm.th)
 
