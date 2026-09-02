@@ -436,7 +436,11 @@ static void ESP_MQTT_Init(void)
                  "\"{\\\"deviceId\\\":\\\"" DEVICE_ID "\\\",\\\"state\\\":\\\"offline\\\"}\",1,1");
         ESP_SendAT(cmd, 1000);
         base = g_rxHead;                        /* 应答基准: +MQTTCONNECTED URC 可能紧随 OK 到达 */
-        snprintf(cmd, sizeof(cmd), "AT+MQTTCONN=0,\"%s\",%d,30", BROKER_IP, BROKER_PORT);
+        /* ESP-AT v2.x 文档: AT+MQTTCONN=<LinkID>,<"host">,<port>,<reconnect>
+           第4参是 reconnect(0/1) 标志而非 keepalive(复审 P2-N3);
+           keepalive=30s 已由上方 MQTTCONNCFG 第2参正确配置。
+           此处取 0(不依赖 ESP-AT 内部自动重连), 断线重连统一由主循环 30s 状态机负责 */
+        snprintf(cmd, sizeof(cmd), "AT+MQTTCONN=0,\"%s\",%d,0", BROKER_IP, BROKER_PORT);
         if (!ESP_SendAT(cmd, 4000)) continue;               /* 命令被拒 */
         if (!ESP_RxWaitToken("+MQTTCONNECTED", base, 5000)) continue;  /* 未连上 Broker */
         g_mqttOk = 1;
@@ -475,10 +479,20 @@ static uint8_t MQTT_Publish(const char *topic, const char *payload)
     while ((g_msTicks - start) < 1000u) {       /* 等命令应答 OK */
         if (ESP_RxScan("\r\nOK\r\n", base)) break;
         if (ESP_RxScan("\r\nERROR\r\n", base) ||
-            ESP_RxScan("\r\nFAIL\r\n", base)) return 0;
+            ESP_RxScan("\r\nFAIL\r\n", base)) {
+            g_mqttOk = 0;                       /* 命令被拒也标记重连, 与 '>' 超时/
+                                                   +MQTTPUB:FAIL 失败路径对齐(复审 P2-N1),
+                                                   消除 URC 丢失时的静默失败窗口 */
+            printf("[NET] MQTTPUBRAW rejected, mark for reconnect\r\n");
+            return 0;
+        }
         IWDG_FEED();
     }
-    if (!ESP_RxScan(">", base)) {               /* 等 '>' 提示符进入数据模式 */
+    /* '>' 提示符紧随 OK(间隔约 1 个字节时间 87µs@115200), 必须阻塞等待:
+       单次 ESP_RxScan 会在 OK 末字节入环形缓冲后几十µs内退出, 大概率漏检 '>'
+       导致每次发布误判失败而整轮重连(复审 P1-N1);
+       ESP_RxWaitToken 内部循环扫描并持续喂狗, 500ms 超时覆盖串口时序抖动 */
+    if (!ESP_RxWaitToken(">", base, 500)) {     /* 阻塞等 '>' 提示符进入数据模式 */
         g_mqttOk = 0;                           /* 视为链路异常, 交主循环 30s 重连 */
         printf("[NET] MQTTPUBRAW no '>' prompt\r\n");
         return 0;
