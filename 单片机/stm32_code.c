@@ -93,7 +93,11 @@ static float         g_iZeroVolt    = 2.5f;     /* 电流通道零点(V), 上电
 #define ADC_FILT_DEPTH   8                      /* 滑动平均窗口深度(与原设计一致) */
 #define ADC_FILT_CH_NUM  2                      /* 参与滤波通道数: 电流/电压各一组 */
 static uint16_t g_adcWin[ADC_FILT_CH_NUM][ADC_FILT_DEPTH] = {{0}}; /* 按通道隔离的滑动窗口 */
-static uint8_t  g_winIdx[ADC_FILT_CH_NUM]       = {0};  /* 每通道独立写索引 */
+/* 写索引 uint16_t(第四轮修补, 原 uint8_t): 仅用于 & (DEPTH-1) 取写槽位,
+   65536 次采样才回绕, 且 65536 是 8 的整数倍, 回绕前后槽位序列连续、窗口不丢;
+   是否播种由独立的 g_winSeeded 标志决定, 与索引值解耦 —— 消除 256 回绕重播种 */
+static uint16_t g_winIdx[ADC_FILT_CH_NUM]       = {0};  /* 每通道独立写索引 */
+static uint8_t  g_winSeeded[ADC_FILT_CH_NUM]    = {0};  /* 每通道首次播种标志 */
 static volatile uint32_t g_msTicks  = 0;        /* 毫秒时基(SysTick中断维护) */
 
 #define VREF            3.300f                  /* ADC 基准电压        */
@@ -321,6 +325,25 @@ static void UART2_SendString(const char *s)
 /* ---- USART2 接收环形缓冲: 收 ESP8266 URC(+MQTTSUBRECV 等), 主循环轮询解析 ---- */
 static volatile char     g_rxBuf[512];
 static volatile uint16_t g_rxHead = 0, g_rxTail = 0;
+/* 行拼接缓冲(协议解析状态机的半帧状态): ESP_RxPoll 逐字节拼行,
+   放文件作用域以便重连回退路径 ESP_RxFlush 连同环形缓冲一起复位 */
+static char     g_lineBuf[256];
+static uint16_t g_lineLen = 0;
+
+/* 清接收缓冲 + 半帧状态, 供连接回退/重连路径(ESP_MQTT_Init)在 AT+RST 前调用:
+   ESP8266 复位后上一会话的残留字节(半帧 URC/未完成的应答)全部作废, 若不清空,
+   会与新会话的启动横幅拼接成假行, 污染下一轮解析(第四轮修补项)。
+   清理层次: 串口环形缓冲(读写指针归零)与协议解析状态机(半行长度清零)两层同清 ——
+   环缓冲内尚未拼成行的字节就是状态机的半帧输入, 二者耦合, 只清一层仍残留半帧。
+   双指针复位放在短暂关闭 USART2 中断的临界区内, 避免与 ISR 写 g_rxHead 竞争 */
+static void ESP_RxFlush(void)
+{
+    NVIC_DisableIRQ(USART2_IRQn);
+    g_rxHead = 0;
+    g_rxTail = 0;
+    NVIC_EnableIRQ(USART2_IRQn);
+    g_lineLen = 0;                              /* 丢弃拼接中的半帧(仅主循环访问) */
+}
 
 void USART2_IRQHandler(void)
 {
@@ -425,6 +448,9 @@ static void ESP_MQTT_Init(void)
     uint8_t retry;
     uint16_t base;
     for (retry = 0; retry < 3; retry++) {
+        ESP_RxFlush();                          /* 回退路径先清接收缓冲/半帧状态(第四轮修补):
+                                                   上一会话或上一轮失败尝试的残留字节随
+                                                   ESP 复位作废, 不污染本轮解析 */
         ESP_SendAT("AT+RST", 3000);
         ESP_SendAT("AT+CWMODE=1", 500);
         snprintf(cmd, sizeof(cmd), "AT+CWJAP=\"%s\",\"%s\"", WIFI_SSID, WIFI_PASS);
@@ -560,9 +586,15 @@ static uint16_t ADC_ReadFiltered(uint8_t ch)
         for (j = 0; j < 4 - i; j++)
             if (s[j] > s[j+1]) { uint16_t t = s[j]; s[j] = s[j+1]; s[j+1] = t; }
     g_adcWin[slot][g_winIdx[slot] & (ADC_FILT_DEPTH - 1)] = s[2];
-    if (g_winIdx[slot] == 0) {                  /* 首次采样播种整窗, 避免开机曲线凹陷 */
+    if (!g_winSeeded[slot]) {                   /* 首次采样播种整窗, 避免开机曲线凹陷。
+                                                   原以 uint8_t idx==0 判定, 每通道 256 次
+                                                   采样(2s 周期约 8.5min)回绕到 0 会整窗
+                                                   重播种, 滤波记忆周期性清零(复审 P2-N2);
+                                                   改为独立标志仅上电播种一次, 稳态下输出
+                                                   与原实现逐次等价, 仅消除周期性失忆 */
         uint8_t n;
         for (n = 0; n < ADC_FILT_DEPTH; n++) g_adcWin[slot][n] = s[2];
+        g_winSeeded[slot] = 1;
     }
     g_winIdx[slot]++;
     for (i = 0; i < ADC_FILT_DEPTH; i++) sum += g_adcWin[slot][i];
@@ -797,9 +829,8 @@ static void Cmd_Handle(const char *line)
 /* 主循环轮询: 从环形缓冲拼行, 命中 cmd 主题的 URC 交命令处理 */
 static void ESP_RxPoll(void)
 {
-    static char     g_lineBuf[256];
-    static uint16_t g_lineLen = 0;
-
+    /* 行缓冲 g_lineBuf/g_lineLen 为文件作用域静态(见环形缓冲定义处):
+       重连回退路径 ESP_RxFlush 需复位半帧状态(第四轮修补) */
     while (g_rxTail != g_rxHead) {
         char c = g_rxBuf[g_rxTail];
         g_rxTail = (uint16_t)((g_rxTail + 1) % sizeof(g_rxBuf));

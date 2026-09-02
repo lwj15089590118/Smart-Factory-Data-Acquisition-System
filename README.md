@@ -130,6 +130,10 @@ cd Python上位机
 python -m pytest tests/ -q
 ```
 
+数据文件口径：`Python上位机/data/history.csv`（列头 `uptime,time,temp,humi,current,voltage,alarm`）
+与看板"导出 CSV"接口 `/api/export.csv`（列头 `ts,temp,humi,current,voltage,alarm`）均统一为
+**UTF-8 无 BOM** 编码、逗号分隔；读端按 UTF-8 直接解析即可，无需剥离 BOM。
+
 ## 六、硬件清单（BOM 摘要）
 
 | 器件 | 型号/规格 | 数量 |

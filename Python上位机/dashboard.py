@@ -112,6 +112,10 @@ class DataStore:
         return True
 
     def _append_csv(self, ts: float, point: dict) -> None:
+        # 编码口径(复审 P2-9 统一): 落盘 CSV 固定 UTF-8 无 BOM, 与读端
+        # (测试/脚本按 encoding="utf-8" 直接读)及 /api/export.csv
+        # (pandas to_csv 默认同为 UTF-8 无 BOM)一致; 列头全 ASCII。
+        # 勿改 utf-8-sig: BOM 会混入首列表头, 读端将得到 "\ufeffuptime"
         new_file = not os.path.exists(Config.CSV_PATH)
         with open(Config.CSV_PATH, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
@@ -137,26 +141,40 @@ class DataStore:
             df = pd.DataFrame(dict(self.buf))
         return df if not df.empty else pd.DataFrame(columns=list(self.FIELDS))
 
+    # 统计列与显示名(顺序即前端展示顺序)
+    STAT_COLS = (("temp", "温度degC"), ("humi", "湿度%RH"),
+                 ("current", "电流A"), ("voltage", "电压V"))
+
+    @staticmethod
+    def _stat_entry(s: pd.Series, name: str) -> dict:
+        """单列统计。空列/单样本时对应项返回 None(null)语义, 绝不返回 NaN:
+        pandas 空序列的 max/min/mean 为 NaN, 单样本 std 因 ddof=1 除以 (n-1)
+        为 NaN, 而 NaN 经 json 序列化输出的是非法 JSON 字面量 NaN(复审 P2-7)。
+        null 由前端渲染为 '--'"""
+        if len(s) == 0:
+            return {"name": name, "max": None, "min": None,
+                    "mean": None, "std": None}
+        return {
+            "name": name,
+            "max":  round(float(s.max()), 2),
+            "min":  round(float(s.min()), 2),
+            "mean": round(float(s.mean()), 2),
+            "std":  round(float(s.std()), 3) if len(s) > 1 else None,  # 波动率
+        }
+
     def stats(self, minutes: int = 60) -> dict:
-        """pandas 统计最近 N 分钟的四项指标"""
+        """pandas 统计最近 N 分钟的四项指标。
+        整表为空时各列返回 null(前端显示 --), 时间窗内无数据同理;
+        /api/stats 响应永远不含 NaN, 是合法 JSON"""
         df = self.dataframe()
         if df.empty:
-            return {}
+            return {col: self._stat_entry(pd.Series(dtype=float), name)
+                    for col, name in self.STAT_COLS}
         # uptime 为相对秒，转成真实时间戳便于按时间过滤
         df["clock"] = datetime.now().timestamp() - (df["ts"].iloc[-1] - df["ts"])
         recent = df[df["clock"] >= datetime.now().timestamp() - minutes * 60]
-        out = {}
-        for col, name in (("temp", "温度degC"), ("humi", "湿度%RH"),
-                          ("current", "电流A"), ("voltage", "电压V")):
-            s = recent[col]
-            out[col] = {
-                "name": name,
-                "max":  round(s.max(), 2),
-                "min":  round(s.min(), 2),
-                "mean": round(s.mean(), 2),
-                "std":  round(s.std(), 3),          # 波动率, 越大说明数据越不稳
-            }
-        return out
+        return {col: self._stat_entry(recent[col], name)
+                for col, name in self.STAT_COLS}
 
     def add_event(self, level: str, source: str, message: str) -> None:
         with self.lock:
@@ -406,8 +424,8 @@ async function refresh(){
   gauge.setOption({series:[{data:[{value:d.latest.current,name:'负载电流'}]}]});
   const s = await (await fetch('/api/stats?minutes=60')).json();
   if(s.temp) document.getElementById('stats').innerHTML =
-    Object.values(s).map(x=>`${x.name}: 最大${x.max} / 最小${x.min} /
-     均值${x.mean} / 波动${x.std}`).join('<br>');
+    Object.values(s).map(x=>`${x.name}: 最大${x.max ?? '--'} / 最小${x.min ?? '--'} /
+     均值${x.mean ?? '--'} / 波动${x.std ?? '--'}`).join('<br>');
   const e = await (await fetch('/api/events')).json();
   document.getElementById('events').innerHTML = '<tr><th>时间</th><th>级别</th><th>来源</th><th>内容</th></tr>'
     + e.map(x=>`<tr><td>${esc(x.time)}</td><td class="${esc(x.level)}">${esc(x.level)}</td>
@@ -502,6 +520,7 @@ def api_thresholds():
 @app.route("/api/export.csv")
 def api_export():
     df = store.dataframe()
+    # pandas to_csv 缺省输出即 UTF-8 无 BOM, 与 history.csv 落盘口径一致(复审 P2-9)
     return Response(df.to_csv(index=False), mimetype="text/csv",
                     headers={"Content-Disposition": "attachment; filename=history.csv"})
 

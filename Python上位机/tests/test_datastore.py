@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-"""DataStore.add 单元测试: 合法入库 / 数值范围 / NaN-Inf / QoS1 去重 / 时间戳回退"""
+"""DataStore 单元测试: add 合法入库 / 数值范围 / NaN-Inf / QoS1 去重 / 时间戳回退;
+stats 空数据与单样本边界(null 语义, 不产生 NaN, 复审 P2-7); CSV 编码口径(UTF-8 无 BOM)"""
+import json
+
 import pytest
 
 import dashboard
@@ -35,6 +38,15 @@ class TestAddValid:
         assert len(rows) == 2                       # 表头 + 1 行数据
         assert rows[0].startswith("uptime,time")    # CSV 表头含 uptime/time
         assert rows[1].startswith("100.0")          # 首列为 uptime
+
+    def test_csv_utf8_no_bom(self, store):
+        """CSV 编码口径统一为 UTF-8 无 BOM(复审 P2-9): 文件头不得出现
+        EF BB BF, 否则按 utf-8 直读的读端首列表头会变成 '\\ufeffuptime'"""
+        assert store.add(_payload(uptime=100)) is True
+        with open(dashboard.Config.CSV_PATH, "rb") as f:
+            head = f.read(64)
+        assert not head.startswith(b"\xef\xbb\xbf")             # 无 BOM
+        assert head.decode("utf-8").startswith("uptime,time")   # 列头干净可解析
 
     def test_alarm_defaults_zero(self, store):
         p = _payload(uptime=100)
@@ -92,3 +104,38 @@ class TestDedupAndRegression:
 
     def test_first_sample_with_zero_uptime_accepted(self, store):
         assert store.add(_payload(uptime=0)) is True
+
+
+class TestStatsNullSemantics:
+    """stats 空数据/边界口径(复审 P2-7): 空库与单样本不再产生 NaN,
+    对应项返回 null, json 序列化永远是合法 JSON; 前端将 null 渲染为 '--'"""
+
+    def test_stats_empty_store_all_null(self, store):
+        """空库: 四列齐全且各项为 null, 不含 NaN 字面量"""
+        out = store.stats(60)
+        assert set(out) == {"temp", "humi", "current", "voltage"}
+        for entry in out.values():
+            assert entry["max"] is None and entry["min"] is None
+            assert entry["mean"] is None and entry["std"] is None
+        assert "NaN" not in json.dumps(out)         # NaN 会生成非法 JSON
+
+    def test_stats_single_sample_std_null(self, store):
+        """单样本: std 因 ddof=1 除以 (n-1)=0 无定义, 修复前返回 NaN,
+        现返回 null; max/min/mean 仍为数值"""
+        store.add(_payload(uptime=1000))
+        out = store.stats(60)
+        assert out["temp"]["max"] == 26.8
+        assert out["temp"]["min"] == 26.8
+        assert out["temp"]["mean"] == 26.8
+        assert out["temp"]["std"] is None
+        assert "NaN" not in json.dumps(out)
+
+    def test_stats_two_samples_numeric_no_nan(self, store):
+        """双样本稳态: 各项为数值且合法 JSON(std=0, 无波动)"""
+        store.add(_payload(uptime=1000, temp=26.0))
+        store.add(_payload(uptime=1005, temp=26.0))
+        out = store.stats(60)
+        assert out["temp"]["max"] == 26.0 and out["temp"]["min"] == 26.0
+        assert out["temp"]["mean"] == 26.0
+        assert out["temp"]["std"] == 0.0
+        assert "NaN" not in json.dumps(out)
