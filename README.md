@@ -1,11 +1,14 @@
 # Smart-Factory-Data-Acquisition-System（智能工厂数据采集系统）
 
+[![CI](https://github.com/lwj15089590118/Smart-Factory-Data-Acquisition-System/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/lwj15089590118/Smart-Factory-Data-Acquisition-System/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 ![STM32](https://img.shields.io/badge/MCU-STM32F103C8T6-blue)
 ![Language](https://img.shields.io/badge/Language-C%20%2F%20Python-orange)
 ![MQTT](https://img.shields.io/badge/Protocol-MQTT%203.1.1-green)
 ![Flask](https://img.shields.io/badge/Web-Flask%20%2B%20ECharts-red)
 ![Pandas](https://img.shields.io/badge/Data-pandas-purple)
-![License](https://img.shields.io/badge/License-MIT-lightgrey)
 
 ## 一、项目简介
 
@@ -50,6 +53,8 @@ flowchart LR
 ```
 Smart-Factory-Data-Acquisition-System/
 ├── README.md                        # 本文件
+├── .github/
+│   └── workflows/ci.yml             # CI：上位机依赖安装+语法编译+35项pytest（固件不进CI）
 ├── 单片机/
 │   ├── stm32_code.c                 # STM32 采集节点主程序（Keil MDK + 标准外设库）
 │   └── 硬件接线图.md                # 全部引脚连接说明（文字 + ASCII 图）
@@ -155,6 +160,57 @@ python -m pytest tests/ -q
 - 电气布局：[电气图纸/数据采集柜布局图.txt](电气图纸/数据采集柜布局图.txt)（纯文本字符画模拟）
 - 操作手册：[用户手册/操作说明书.md](用户手册/操作说明书.md)
 - 调试档案：[调试日志/调试记录.md](调试日志/调试记录.md)
+
+## 八、FAQ（常见问题）
+
+**Q1：上下位机时间怎么对齐？会不会时钟漂移？**
+
+不做全网对时。节点只上报自开机起单调递增的 `uptime` 秒，看板直接以它为数据时间轴；
+协议字段与解析顺序**两端互锁**，由 `tests/test_protocol.py` 保证：cmd 方向用纯 Python 复刻
+固件 `Cmd_Handle/Cmd_ParseNum/Cmd_ParseId` 的解析器回放、data 方向按固件 `UploadData` 的
+printf 格式复刻上行走文，断言两端生效的阈值与入库字段一致。
+
+**Q2：节点断网/断线了怎么办？**
+
+固件解析 `WIFI DISCONNECT` / `+MQTTDISCONNECTED` URC 清连接标志，主循环以 **30s 周期重连**；
+重连成功后自动重订阅 cmd 主题并重发 retained `online`（`MQTTCONNCFG` 关闭 clean session，
+Broker 侧会话同样保持，双保险）。异常掉线由 LWT 遗嘱让 Broker 代发 retained `offline`，看板
+据此感知节点离线。断网期间现场照常采集/显示/报警，历史数据不补传（设计口径，见简介）。
+
+**Q3：上行为什么用 MQTTPUBRAW，status 却用 MQTTPUB？**
+
+`AT+MQTTPUB` 的 data 参数内含引号必须转义且整条命令长度受限；温湿度/电流/电压 JSON 约
+115~140 字节、含大量双引号，转义易错，故走 `AT+MQTTPUBRAW` 定长裸数据模式：发命令 → 等
+`>` 提示符（阻塞等待，超时 500ms）→ 按声明长度发裸数据（免转义）→ 等 `+MQTTPUB:OK`；数据
+末尾**不需要 0x1A**（那是 TCP 透传模式的结束符，计入长度会混入 payload 破坏 JSON）。
+status 短报文（约 52 字节）保留 `AT+MQTTPUB` 并正确转义引号。
+
+**Q4：为什么固件不能像上位机一样在线编译/进 CI？**
+
+固件需要 Keil MDK 工程 + STM32F10x 标准外设库 + `oledfont.h` 字库，仓库当前未包含完整工程
+（如实说明），GitHub runner 亦无 ARM/Keil 工具链。因此 CI 只覆盖 Python 上位机（依赖安装 +
+语法编译 + 35 项 pytest，每条命令均本机预跑绿后写入）；固件侧以静态审查与 Python 移植仿真
+验证，Keil 工程入库后再扩展固件构建（见 Roadmap）。
+
+**Q5：统计接口的 NaN 是怎么防的？**
+
+双层防线：① 入库前用 `math.isfinite` 过滤 NaN/Inf，并做物理范围校验（如温度 -50~120°C），
+非法报文直接丢弃；② `/api/stats` 对空窗口、单样本（`std` 的 ddof=1 需 n>1）统一返回 `null`、
+前端渲染为 `--`——pandas 空序列的 max/min/mean 与单样本 std 均为 NaN，直接 `json.dumps`
+会输出非法 JSON 字面量 `NaN`（复审 P2-7 已修复，含 3 个边界回归用例）。
+
+**Q6：QoS1 重复投递怎么办？**
+
+看板按 `uptime` 单调性去重：与上一条相同或回退不超过 5s 容忍窗口的报文视为 QoS1 重复/乱序
+直接丢弃；仅大幅回退才按"节点重启"接受并另起新序列，避免积压旧报文与新数据交错造成曲线跳变。
+
+## 九、Roadmap（依据复审报告12残留项，如实列示）
+
+- [ ] **固件真机验证**：Keil MDK 编译 + ESP-01S 真机联调——发布链路（MQTTPUBRAW）、断线→30s 重连→重订阅→阈值下发/cmd_resp 回执的全链路回归；
+- [ ] **Keil 工程入库**：补 `oledfont.h` 与可编译工程骨架，让固件可从仓库复现构建（并扩展 CI 覆盖面）；
+- [ ] **OLED 负电流显示修正**（复审 P2-N4 残留）：ACS712 双向电流为负时 `I:%d.%02dA` 会拼出 `I:-6.-50A` 畸形，需先取绝对值再拼符号；
+- [ ] **协议 §5.1 口径拉齐**（复审 P2-N5 残留）：时间戳"大幅回退"在协议文档写"直接丢弃"、代码按"视为节点重启接受"处理，文档与代码二选一对齐；
+- [ ] **调试证据链归档**：为调试日志"15 天调试 / 24h 拷机 17280 条"补充原始数据支撑。
 
 ## License
 

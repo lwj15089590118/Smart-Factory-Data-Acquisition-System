@@ -1,0 +1,37 @@
+name: CI
+
+# 范围说明: CI 只覆盖 Python 上位机(可自动化验证)。
+# 固件侧(单片机/stm32_code.c, Keil MDK 5.36 + STM32F10x 标准外设库 V3.5 + oledfont.h 字库)
+# 不纳入 CI: ubuntu runner 无 ARM/Keil 工具链, 且仓库尚未包含可编译的 Keil 工程与字库文件,
+# 无法在线复现固件构建(见 README Roadmap)。固件目前以静态审查 + Python 移植仿真方式验证。
+# 以下每条命令均已在本机(Python 3.12.10, Windows)预跑全绿后才写入本工作流。
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: 'Python上位机/requirements.txt'
+
+      - name: Install host dependencies
+        run: pip install -r "Python上位机/requirements.txt"
+
+      - name: Syntax check (compileall)
+        run: python -m compileall -q "Python上位机"
+
+      - name: Unit tests (35 pytest cases, conftest stubs isolate data dir)
+        run: python -m pytest "Python上位机/tests" -q
