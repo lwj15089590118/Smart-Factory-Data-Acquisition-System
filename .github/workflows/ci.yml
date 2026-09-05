@@ -28,7 +28,7 @@ jobs:
           cache-dependency-path: 'Python上位机/requirements.txt'
 
       - name: Install host dependencies
-        run: pip install -r "Python上位机/requirements.txt"
+        run: pip install -r "Python上位机/requirements.txt" pytest
 
       - name: Syntax check (compileall)
         run: python -m compileall -q "Python上位机"
